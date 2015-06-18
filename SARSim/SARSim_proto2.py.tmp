@@ -1,0 +1,549 @@
+#-------------------------------------------------------------------------------
+# Name:        SAR image simulator
+# Purpose:
+#
+# Author:      vfomin
+#
+# Created:     08/06/2015
+# Copyright:   (c) vfomin 2015
+# Licence:     <your licence>
+#-------------------------------------------------------------------------------
+
+
+# Numpy, Matplotplib
+import numpy as np
+import matplotlib.pyplot as plt
+
+# Project
+import GlobalConsts as GC
+
+
+def logPrint(message):
+    print message
+
+
+class SARSim:
+
+    def __init__(self, platform, verbose=False):
+        """
+
+        SAR image simulator
+        Geometry :
+            - Azimuth direction is along OX axis
+            - Range direction is along OY axis
+
+        """
+        self.platform = platform
+        self.xArray = None
+        self.targets = None
+
+        self.verbose = verbose
+
+
+    def setTargets(self, targets):
+        """
+        Method to set targets
+        targets = [[x0,y0,vx0,vy0], [x1,y1,vx1,vy1], ...]
+        """
+        self.targets = [None]*len(targets)
+        for i, target in enumerate(targets):
+            assert len(target) == 2 or len(target) == 4, logPrint("A target should be [x0,y0] or [x0,y0,vx0,vy0]")
+            self.targets[i] = target if len(target) == 4 else [target[0], target[1], 0.0, 0.0]
+
+    def setParams(self, params):
+        """
+        Method to set acquisition parameters:
+        params = [[xmin, xmax], [theta_min, theta_max], [sceneX, sceneY]]
+
+        xmin, xmax - azimuth min/max position during the signal acquisition
+        theta_min, theta_max - min/max incidence angles (in degrees)
+        sceneX, sceneY - zone center position (used for RCMC)
+        """
+        assert len(params) == 3, logPrint("Aquisition parameters should be of the form [[xmin, xmax], [theta_min, theta_max], [sceneX, sceneY]]")
+
+        self._params = params
+        dx = self.platform.Vsat / (1.4 * self.platform.PRF)
+##        dx = self.platform.Vsat / self.platform.PRF
+
+        Nx = int( 1 + (self._params[0][1] - self._params[0][0]) / dx )
+
+        if self.verbose:
+            print "Number of azimuth samples :", Nx
+        assert Nx > 100, logPrint("Number of azimuth samples is too small. Take a larger azimuth zone ")
+        assert Nx < 4096, logPrint("Number of azimuth samples is too large. Take a smaller azimuth zone ")
+        self.xArray = np.arange(self._params[0][0], self._params[0][1], dx)
+        self.dx = dx
+
+        self.tArray, self.dt = self._computeRangeTimeArray()
+
+
+    def computeRawData(self):
+        """
+        Method to compute and get raw data response
+
+        Returns (raw data 2D array, azimuth positions, range time array)
+        """
+        assert self.targets is not None, logPrint("Targets should be set")
+        assert self.xArray is not None and self.tArray is not None, logPrint("Acquisition parameters should be set")
+
+        self.rawData = np.zeros((len(self.xArray), len(self.tArray)),dtype=complex)
+        deltaX = np.abs(self._params[0][1] - self._params[0][0])
+        self.xSwath = self._computeXSwath()
+
+        if self.verbose:
+            print "XBand: ", deltaX
+            print "xSwath: ", self.xSwath
+
+        for target in self.targets:
+            dist = lambda x : distance(x / self.platform.Vsat, self.platform.Vsat,
+                                self.platform.H, target[0], target[1], target[2], target[3])
+            Wa = lambda x : approxWa(x,target[0], self.xSwath)
+
+            for index, t in enumerate(self.tArray):
+                self.rawData[:, index] += received2DSignal(t, self.xArray[:], dist,
+                                            self.platform.Tp, self.platform.Freq, self.platform.K, Wa)
+
+        return self.rawData, self.xArray, self.tArray
+
+
+    def computeCompressedData_depricated(self):
+        """
+        Apply RDA on raw data
+        1) Range compression
+        2) Range Cell Migration Correction
+        3) Azimuth compression
+
+        Returns (compressed 2D array, azimuth positions, range positions)
+        """
+##        rawData = self.rawData if self.rawData is not None else Srx
+        rawData = self.rawData
+        assert rawData is not None, logPrint("Raw data should be computed ( using computeRawData() ) or provided as argument")
+
+        # 1) Range compression :
+        tArray0=np.arange(-self.platform.Tp*0.5,self.platform.Tp*0.5,self.dt)
+        h = GC.chirpSignal(tArray0, self.platform.Tp, -self.platform.K)
+        procData = compression(rawData, h, 'range')
+
+        if self.verbose:
+            showResponse(procData, [self.tArray[0], self.tArray[-1], self.xArray[0], self.xArray[-1]], 'Range compression')
+
+        # 2) Range migration :
+        xc = self._params[2][0]
+        yc = self._params[2][1]
+        dist = lambda x : distance(x / self.platform.Vsat, self.platform.Vsat,
+                                    self.platform.H, xc, yc)
+        dR = deltaR(self.xArray, xc, dist)
+        dRI = np.round(dR).astype(np.int)
+        procData = rangeMigration(procData, dRI)
+
+        if self.verbose:
+            showResponse(procData, [self.tArray[0], self.tArray[-1], self.xArray[0], self.xArray[-1]], 'RCMC')
+
+        # 3) Azimuth compression :
+        Rc = dist(xc)
+        Ka = 2.0 / self.platform.Lambda * 1.0 / Rc
+        h = GC.rect((self.xArray-xc)/self.xSwath) * np.exp(1j * np.pi * Ka * (self.xArray - xc)**2)
+        procData = compression(procData, h, 'azimuth')
+
+        return procData, self.xArray, self.tArray
+
+
+    def computeCompressedData(self):
+        """
+        Apply RDA on raw data
+        1) Range compression
+        2) Range Cell Migration Correction
+        3) Azimuth compression
+
+        Returns (compressed 2D array, azimuth positions, range positions)
+        """
+        rawData = self.rawData
+##        rawData = self.rawData if self.rawData is not None else Srx
+        assert rawData is not None, logPrint("Raw data should be computed ( using computeRawData() ) or provided as argument")
+
+        Tp = self.platform.Tp
+        Vsat = self.platform.Vsat
+        K = self.platform.K
+        PRF = self.platform.PRF
+        H = self.platform.H
+        Lambda = self.platform.Lambda
+
+        # 1) Range compression :
+        tArray0=np.arange(-Tp*0.5,Tp*0.5,self.dt)
+        h = GC.chirpSignal(tArray0, Tp, -K)
+        procData = compression(rawData, h, 'range')
+        h=None
+
+        if self.verbose:
+            showResponse(procData, [self.tArray[0], self.tArray[-1], self.xArray[0], self.xArray[-1]], 'Range compression')
+
+        # 2) Azimuth FFT :
+        procDataAF = np.zeros(procData.shape, dtype=complex)
+        for i in range(procDataAF.shape[1]):
+            # get range fixed column
+            procDataAF[:,i] = GC.fft(procData[:,i])
+        procData = procDataAF
+        procDataAF = None
+
+
+        fArray = np.fft.fftshift(np.fft.fftfreq( procData.shape[0], self.dx / self.platform.Vsat))
+        if self.verbose:
+            showResponse(procData, [self.tArray[0], self.tArray[-1], fArray[0], fArray[-1]], 'Azimuth FFT')
+
+        # 3) Range migration :
+##        DxArray = distance(self.xArray/Vsat, Vsat, H, xc, yc)
+##        fEtaArray = -2.0/Lambda * (self.xArray - xc) * Vsat / DxArray
+
+##        if self.verbose:
+##            plt.title("Azimuth frequency vs azimuth positions")
+##            plt.plot(self.xArray, fEtaArray, label="f_eta")
+##            plt.plot(self.xArray, fArray, label="fArray")
+##            plt.xlabel("Azimuth position")
+##            plt.ylabel("Azimuth frequency")
+##            plt.legend()
+##            plt.show()
+
+##        fIndices = [0, 500, 1000, 1500, 2000]
+##        for fMdle in fIndices:
+##            y = procData[fMdle,:]
+##            d = np.sqrt(1.0 - (0.5 * Lambda * fArray[fMdle] / Vsat)**2)
+##
+##            print "fArray[fMdle] : ", fArray[fMdle]
+##            print "D: ", d
+##            tArray2 = self.tArray / d
+##            plt.plot(self.tArray)
+##            plt.plot(tArray2)
+##            plt.show()
+##
+##            y2 = np.interp(tArray2, self.tArray, np.real(y)) + 1j * np.interp(tArray2, self.tArray, np.imag(y))
+##
+##            plt.plot(self.tArray, np.abs(y))
+##            plt.plot(self.tArray, np.abs(y2))
+##            plt.show()
+
+        Dfreq = np.sqrt(1.0 - (0.5 * Lambda * fArray / Vsat)**2)
+##        dRfreq = Rc / Dfreq - Rc
+##        if self.verbose:
+##            plt.title("deltaR vs azimuth frequency")
+##            plt.plot(fEtaArray, dRfreq)
+##            plt.xlabel("Azimuth frequency")
+##            plt.show()
+
+##        dRIfreq = np.round(dRfreq).astype(np.int)
+        procData = rangeMigration2(procData, self.tArray, Dfreq)
+        Dfreq = None
+
+        if self.verbose:
+            showResponse(procData, [self.tArray[0], self.tArray[-1], fArray[0], fArray[-1]], 'RCMC')
+
+
+        # 4) Azimuth compression :
+##        xc = self._params[2][0]
+##        yc = self._params[2][1]
+##        Rc = np.sqrt(H**2 + yc**2)
+##        Ka = 2.0 / Lambda * 1.0 / Rc
+##        h = GC.rect((self.xArray-xc)/self.xSwath) * np.exp(1j * np.pi * Ka * (self.xArray - xc)**2)
+##        H = GC.fft(h)
+
+        xc = self.xArray[len(self.xArray)/2]
+        for i in range(procData.shape[1]):
+            Ka = 4.0 * Vsat**2 / Lambda / GC.C /self.tArray[i]
+            hMF = GC.rect((self.xArray-xc)/self.xSwath) * np.exp(1j * np.pi * Ka/Vsat**2 * (self.xArray - xc)**2)
+            HMF = GC.fft(hMF)
+            procData[:,i] = procData[:,i] * HMF
+
+
+        # 5) Azimuth IFFT
+        procDataAF = np.zeros(procData.shape, dtype=complex)
+        for i in range(procDataAF.shape[1]):
+            # get range fixed column
+            procDataAF[:,i] = GC.ifft(procData[:,i])
+        procData = procDataAF
+        procDataAF = None
+
+        if self.verbose:
+            showResponse(procData, [self.tArray[0], self.tArray[-1], fArray[0], fArray[-1]], 'Compressed image')
+
+        yArray = np.sqrt( (0.5 * GC.C * self.tArray)**2 - H**2 )
+
+        return procData, self.xArray, yArray
+
+
+
+
+    def _computeXSwath(self):
+        thetaX = self.platform.Lambda / self.platform.La
+        angleC = (self._params[1][1] + self._params[1][0])*0.5
+        ycenter = self.platform.H * np.tan(angleC * np.pi / 180.0)
+        rc = np.sqrt(self.platform.H**2 + ycenter**2)
+        return 2.0 * np.tan(thetaX *0.5) * rc
+
+    def _computeRangeTimeArray(self):
+        B = self.platform.Tp*np.abs(self.platform.K)
+        dt = 1.0/(1.4*B)
+
+        ymin = self.platform.H * np.tan(self._params[1][0] * np.pi / 180.0)
+        ymax = self.platform.H * np.tan(self._params[1][1] * np.pi / 180.0)
+        rmin = np.sqrt(self.platform.H**2 + ymin**2)
+        deltaX = np.abs(self._params[0][1] - self._params[0][0])
+        rmax = np.sqrt(self.platform.H**2 + deltaX**2 + ymax**2)
+        if self.verbose:
+            print "rmin, rmax", rmin, rmax
+
+        tmin = -0.55*self.platform.Tp + 2.0 * rmin / GC.C
+        tmax = 0.55*self.platform.Tp + 2.0 * rmax / GC.C
+        if self.verbose:
+            print "tmin, tmax", tmin, tmax
+
+        Nt = int( 1 + (tmax - tmin) / dt )
+        if self.verbose:
+            print "Number of range samples :", Nt
+        assert Nt > 100, logPrint("Number of range samples is too small.")
+        assert Nt < 4096, logPrint("Number of range samples is too large. Take a smaller acquisition angles")
+
+        tArray = np.arange(tmin, tmax, dt)
+        if (len(tArray) % 2 == 1):
+            tArray = np.resize(tArray, (len(tArray)-1))
+        return tArray, dt
+
+
+def compression(Srx, h, dim0):
+    """
+    Matched filter alogorith with filter 'h' is applied on
+    the image 'Srx' on the dimension 'dim'
+
+    dim is 'range' or 'azimuth'
+
+    """
+
+    dim = 1 if dim0 is 'range' else 0 if dim0 is 'azimuth' else -1
+    assert dim >= 0, logPrint("Parameter dim should be 'range' or 'azimuth'")
+    # inverse of dim
+    idim = np.abs(dim-1)
+    # pad received and emitted signals on common time stemp
+    # to obtain common fft
+    n1 = len(h)
+    n2 = Srx.shape[dim]
+
+    Nsa = n1 + n2 - 1
+##    Nsa2 = int(np.power(2.0, np.ceil(np.log2( Nsa ))))
+    Nsa2 = Nsa if Nsa % 2 == 0 else Nsa+1
+
+
+##    shape = (Srx.shape[0], Nsa2) if dim == 1 else (Nsa2, Srx.shape[1])
+##    SrxMF=np.zeros(shape,dtype=complex)
+    SrxMF=np.zeros(Srx.shape,dtype=complex)
+    hMF = np.concatenate((np.zeros(np.floor((Nsa2-n1)*0.5)), h, np.zeros(np.ceil((Nsa2-n1)*0.5))))
+    HMF = GC.fft(hMF)
+
+    m1 = np.floor((Nsa2-n2)*0.5)
+    m2 = np.ceil((Nsa2-n2)*0.5)
+    for i in range(Srx.shape[idim]):
+        data = Srx[i,:] if dim == 1 else Srx[:,i]
+        dataMF = np.concatenate((np.zeros(m1), data, np.zeros(m2)))
+        DataMF = GC.fft(dataMF)
+        DataMF = DataMF * HMF
+        if dim == 1:
+            SrxMF[i,:] = GC.ifft(DataMF)[n1/2:n1/2+n2]
+        else:
+            SrxMF[:,i] = GC.ifft(DataMF)[n1/2:n1/2+n2]
+
+    return SrxMF
+
+
+def deltaR(x,xc,dist):
+    """
+    delta R for a stationary ground target zone
+    deltaR = R(x) - Rc,
+    where R(x) is the distance when sensor is at azimuth point x
+    Rc=(xc,yc) is the smallest distance to the center of the zone
+
+    - x is the numpy array of azimuth positions
+    - xc is the azimuth position of the targeted zone
+    - dist is the distance function
+
+    """
+    return dist(x) - dist(xc)
+
+def rangeMigration(Srx, dRI):
+    """
+    RCMC algorithm
+    """
+    Srm = np.zeros(Srx.shape, dtype=complex)
+    rcm_max = dRI.max()
+
+    # Loop on rows
+    ind1=np.arange(int(Srm.shape[1] - rcm_max),dtype=int)
+    for i in range(Srm.shape[0]):
+        # Loop on row elements:
+        ind2 = ind1+dRI[i]
+        Srm[i,ind1[:]] = Srx[i,ind2]
+
+    return Srm
+
+def rangeMigration2(Srx, tArray, Dfreq):
+    """
+    RCMC algorithm with interpolation
+    """
+    assert Srx.shape[0] == len(Dfreq), logPrint("Error : Srx.shape[0] != len(Dfreq)")
+    assert Srx.shape[1] == len(tArray), logPrint("Error : Srx.shape[1] != len(tArray)")
+
+    Srm = np.zeros(Srx.shape, dtype=complex)
+
+    for i in range(Srm.shape[0]):
+        tArray2 = tArray / Dfreq[i]
+        # Loop on row elements:
+        yRe = np.real(Srx[i,:])
+        yIm = np.imag(Srx[i,:])
+
+        yRe = np.interp(tArray2, tArray, yRe)
+        yIm = np.interp(tArray2, tArray, yIm)
+
+        Srm[i,:] = yRe + 1j * yIm
+
+    return Srm
+
+
+
+def distance(etaArray, Vsat, H, x0, y0, vx0=0.0, vy0=0.0, ax0=0.0, ay0=0.0):
+    """
+    Range distance between sensor and a single ground target
+    R(etaArray)^2 = H^2 + (y0 + vy0 * etaArray + 0.5*ay0 * etaArray^2)^2
+                        + (x0 + vx0 * etaArray + 0.5*ax0 * etaArray^2 - Vsat * etaArray)^2
+    x0, y0 is target's position
+    vx0, vy0 is target's velocity
+    ax0, ay0 is target's acceleration
+    Vsat is sensor's velocity
+    etaArray is the azimuth time
+    """
+    y2 = y0 + vy0 * etaArray + 0.5*ay0*etaArray**2
+    y2 = y2**2
+    x2 = x0 + vx0 * etaArray + 0.5*ax0*etaArray**2 - Vsat * etaArray
+    x2 = x2**2
+    return np.sqrt(H**2 + y2 + x2)
+
+def received2DSignal(t, x, dist, tau_p, f_c, K_r, Wa, sigma=1) :
+    """
+    SAR received signal at range time t and azimuth position x
+    S_{out}(t,x) = rect( (t-2*d(x)/c) / tau_p) * Wa(x) * sigma
+                    * exp( -4*pi*1j* f_c * d(x)/c + 1j*pi*K_r*(t-2*d(x)/c)^2 )
+
+    """
+    tt = t - 2.0*dist(x) / GC.C
+    phase = -4.0*f_c*dist(x) / GC.C + K_r*(tt**2)
+    return GC.rect( tt/tau_p ) * Wa(x) * sigma * np.exp(1j*np.pi*phase)
+
+
+def approxWa(x,x_c,deltaX):
+    """
+    Antenna Beam pattern
+    Approximation of a uniform aperture (see SARAS: A synthetic Aperture Radar (SAR) Raw Signal Simulator, G.Franceschetti)
+    Wa(x) = sinc^2 ( (x - x_c)/deltaX ) where
+        deltaX - azimuth swath
+    """
+    wa = np.sinc( (x-x_c) / deltaX )
+    return wa**2
+
+def showResponse(Srx, extent=None, title="Figure"):
+    f = plt.figure()
+    f.suptitle(title)
+    plt.subplot(221)
+    plt.title("SAR response, module")
+    plt.xlabel("Range")
+    plt.ylabel("Azimuth")
+    plt.imshow(np.absolute(Srx), extent=extent, aspect='auto')
+    plt.colorbar()
+    plt.subplot(222)
+    plt.title("SAR response, phase")
+    plt.xlabel("Range")
+    plt.ylabel("Azimuth")
+    plt.imshow(np.angle(Srx), extent=extent, aspect='auto')
+    plt.colorbar()
+    plt.subplot(223)
+    plt.title("SAR response, Re")
+    plt.xlabel("Range")
+    plt.ylabel("Azimuth")
+    plt.imshow(np.real(Srx), extent=extent, aspect='auto')
+    plt.colorbar()
+    plt.subplot(224)
+    plt.title("SAR response, Im")
+    plt.xlabel("Range")
+    plt.ylabel("Azimuth")
+    plt.imshow(np.imag(Srx), extent=extent, aspect='auto')
+    plt.colorbar()
+    plt.show()
+
+
+
+
+if __name__ == '__main__':
+
+    # Test Aerial
+    import GlobalVariablesAerial as Sensor
+    # Test
+    xc = 0.0
+    yc = Sensor.H * np.tan(55.0 * np.pi / 180.0)
+    s = SARSim(Sensor,verbose=True)
+    # define SAR acquisition parameters:
+    params = [[-500, 500], [52.0, 57.0], [xc, yc]]
+    s.setParams(params)
+    # set targets
+
+    # a) stationary targets :
+    targets = [[xc, yc],
+                [xc - 113.0, yc], [xc + 113.0, yc],
+                [xc - 113.0, yc + 213.0], [xc - 113.0, yc - 213.0],
+                [xc + 113.0, yc + 213.0], [xc + 113.0, yc - 213.0],
+                [xc, yc + 213.0], [xc, yc - 213.0]]
+
+    # b) moving targets
+##    targets = [[xc, yc, 7.0, 5.0]]
+##    targets = [[xc-10.0, yc-10.0], [xc, yc, 0.0, 5.0]]
+##    targets = [[xc, yc, 10.0, 0.0], [xc + 100.0, yc, -10.0, 0.0], [xc - 100.0, yc, 10.0, 10.0]]
+
+
+    s.setTargets(targets)
+
+    Srx, xArray, tArray = s.computeRawData()
+    showResponse(Srx, [tArray[0],tArray[-1],xArray[0],xArray[-1]], 'Raw data')
+
+    # data compression
+    S_final, xArray, yArray = s.computeCompressedData()
+    showResponse(S_final, [yArray[0]-yc, yArray[-1]-yc,xArray[0],xArray[-1]], 'Compressed image')
+
+    exit()
+
+    # Test CSK
+    import GlobalVariablesCSK_HI as Sensor
+    # Test
+    xc = 0.0
+    yc = Sensor.H * np.tan(51.00005 * np.pi / 180.0)
+    s = SARSim(Sensor,verbose=True)
+    # define SAR acquisition parameters:
+    params = [[-3000, 3000], [51.0, 51.00010], [xc, yc]]
+    s.setParams(params)
+    # set targets
+    targets = [[xc + 100.0, yc + 100.0], [xc - 150.0, yc - 50.0], [xc, yc], [xc + 200.0, yc]]
+##    targets = [[xc, yc], [xc + 100.0, yc], [xc - 100.0, yc]]
+##    targets = [[xc, yc]]
+    s.setTargets(targets)
+
+    Srx, xArray, tArray = s.computeRawData()
+    showResponse(Srx, [tArray[0],tArray[-1],xArray[0],xArray[-1]], 'Raw data')
+
+    # data compression
+    S_final, xArray, tArray = s.computeCompressedData()
+    showResponse(S_final, [tArray[0],tArray[-1],xArray[0],xArray[-1]], 'Compressed image')
+
+    exit()
+
+
+    # 2D frequency domain
+##    Srx_freq = np.zeros(Srx.shape, dtype=complex)
+##    # first on range, then on azimuth
+##    for i in range(Srx.shape[0]):
+##        Srx_freq[i,:] = GC.fft(Srx[i,:])
+##    for j in range(Srx.shape[1]):
+##        Srx_freq[:,j] = GC.fft(Srx_freq[:,j])
+##
+##    showResponse(Srx_freq, None, '2D freq domain')
